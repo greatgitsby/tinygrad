@@ -457,6 +457,7 @@ class Transformer:
       ssm_layers=ssm_layers,
       qkv_bias='blk.0.attn_q.bias' in state_dict,
       expert_bias=f"blk.{kv.get(f'{arch}.leading_dense_block_count', 0)}.exp_probs_b.bias" in state_dict)
+    model:Transformer
     if arch == 'qwen3vl':
       from tinygrad.llm.qwen3vl import Qwen3VL
       model = Qwen3VL(config, tuple(kv[f'{arch}.rope.dimension_sections'][:3]))

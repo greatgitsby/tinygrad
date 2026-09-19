@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tinygrad import Tensor, TinyJit, dtypes, nn
+from tinygrad import Tensor, TinyJit, UOp, dtypes, nn
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.llm.kernels.amd import Linear
 from tinygrad.llm.model import Transformer, TransformerConfig
@@ -64,7 +64,7 @@ class VisionMerger:
 
   def __call__(self, x:Tensor) -> Tensor:
     x = self.norm(x.reshape(-1, x.shape[-1]*4) if self.postshuffle_norm else x).reshape(-1, x.shape[-1]*4)
-    return self.fc2(self.fc1(x).gelu())
+    return self.fc2(self.fc1(x).gelu(approximate='none'))
 
 
 class _VisionWeights:
@@ -115,7 +115,7 @@ class Qwen3Vision:
   def _block_order(x:Tensor, height:int, width:int) -> Tensor:
     return x.reshape(height//2, 2, width//2, 2, x.shape[-1]).permute(0, 2, 1, 3, 4).reshape(height*width, x.shape[-1])
 
-  def _position_embeddings(self, height:int, width:int, device:str) -> tuple[Tensor, Tensor, Tensor]:
+  def _position_embeddings(self, height:int, width:int, device:str|tuple[str, ...]|None) -> tuple[Tensor, Tensor, Tensor]:
     table = self.v.position_embd.weight.reshape(48, 48, self.dim).permute(2, 0, 1).unsqueeze(0)
     pos = table.interpolate((height, width), mode='linear', align_corners=True).squeeze(0).permute(1, 2, 0)
     pos = self._block_order(pos, height, width)
@@ -160,7 +160,7 @@ class Qwen3VL(Transformer):
       mixed = mask.where(freq[dim], mixed)
     return mixed.cos().cat(mixed.sin(), dim=-1)
 
-  def _run_hidden(self, x:Tensor, start_pos:int, freqs:Tensor, image_range:tuple[int, int]|None=None,
+  def _run_hidden(self, x:Tensor, start_pos:int|UOp, freqs:Tensor, image_range:tuple[int, int]|None=None,
                   deepstack:list[Tensor]|None=None) -> Tensor:
     for i, block in enumerate(self.blk):
       x = block(x, start_pos, freqs)
@@ -173,7 +173,7 @@ class Qwen3VL(Transformer):
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :]
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
-  def _decode(self, token:Tensor, start_pos:int, position:int, temperature:Tensor) -> Tensor:
+  def _decode(self, token:Tensor, start_pos:int|UOp, position:int|UOp, temperature:Tensor) -> Tensor:
     freqs = self._mrope(Tensor.full((3, 1), position, dtype=dtypes.int32, device=token.device))
     return self._sample(self._run_hidden(self.token_embd(token).float(), start_pos, freqs), temperature)
 
@@ -200,8 +200,75 @@ class Qwen3VL(Transformer):
     temp = Tensor([temperature])
     out = self._sample(self._run_hidden(x, 0, self._mrope(pos), image_range, deepstack), temp).realize()
     next_position, start_pos = int(pos.max().item())+1, len(tokens)
-    for _ in range(max_new_tokens):
+    v_start = UOp.variable('vl_start', 0, self.max_context-1)
+    v_position = UOp.variable('vl_position', 0, self.max_context-1)
+    for i in range(max_new_tokens):
       token = int(out.item())
       yield token
-      out = self.decode_jit(out, start_pos, next_position, temp).realize()
+      if i == max_new_tokens-1: break
+      out = self.decode_jit(out, v_start.bind(start_pos), v_position.bind(next_position), temp).realize()
       start_pos, next_position = start_pos+1, next_position+1
+
+
+class Qwen3VLRunner:
+  """Fixed prompt and output budget, captured as one GPU graph; no per-token host reads.
+
+  Construct after materializing model weights. The first two calls compile/capture;
+  measure steady-state latency from the third call, including input upload/output read.
+  The caller truncates the returned tokens at EOS (extra computed tokens are ignored).
+  """
+  def __init__(self, model:Qwen3VL, vision:Qwen3Vision, tokens:list[int], image_range:tuple[int, int],
+               grid:tuple[int, int, int], max_new_tokens:int=16):
+    if not 1 <= max_new_tokens <= model.max_context-len(tokens): raise ValueError('invalid output budget')
+    lo, hi = image_range
+    _, gh, gw = grid
+    if hi-lo != gh*gw//4: raise ValueError('image token count does not match grid')
+    self.model, self.vision = model, vision
+    self.image_range, self.max_new_tokens = image_range, max_new_tokens
+    self.prompt_len = len(tokens)
+    self.next_position = lo+max(gh, gw)//2+len(tokens)-hi
+    positions = [list(range(lo)) for _ in range(3)]
+    for dim in range(3):
+      positions[dim] += [lo + (0 if dim == 0 else h if dim == 1 else w) for h in range(gh//2) for w in range(gw//2)]
+      positions[dim] += list(range(lo+max(gh, gw)//2, self.next_position))
+    self.freqs = model._mrope(Tensor(positions, dtype=dtypes.int32)).realize()
+    self.embeddings = model.token_embd(Tensor([tokens], dtype=dtypes.int32)).float().realize()
+    self.decode_freqs = [model._mrope(Tensor.full((3, 1), self.next_position+i, dtype=dtypes.int32)).realize()
+                        for i in range(max_new_tokens-1)]
+    self.jit = TinyJit(self.forward)
+
+  def _greedy(self, x:Tensor) -> Tensor:
+    return self.model.output(self.model.output_norm(x[:, -1:]))[:, -1].argmax(-1, keepdim=True)
+
+  def forward(self, image:Tensor) -> Tensor:
+    embeds, deepstack, _ = self.vision(image)
+    # Realization boundaries bound compilation memory; TinyJit combines the launches.
+    Tensor.realize(embeds, *deepstack)
+    lo, hi = self.image_range
+    x = self.embeddings[:, :lo].cat(embeds.unsqueeze(0), self.embeddings[:, hi:], dim=1)
+    x = self.model._run_hidden(x, 0, self.freqs, self.image_range, deepstack)
+    out = self._greedy(x).realize()
+    outputs = [out]
+    for i, freqs in enumerate(self.decode_freqs):
+      x = self.model.token_embd(out).float()
+      x = self.model._run_hidden(x, self.prompt_len+i, freqs)
+      out = self._greedy(x).realize()
+      outputs.append(out)
+    return outputs[0].cat(*outputs[1:], dim=1).realize()
+
+  def __call__(self, image:Tensor) -> Tensor:
+    return self.jit(image)
+
+
+def materialize_weights(model, fp16_compute:bool=False) -> None:
+  """Decode GGUF weights once into VRAM instead of on every matmul (fits the 2B model on 8 GB)."""
+  seen = {}
+  for weight in nn.state.get_parameters(model):
+    key = weight.uop
+    if key not in seen: seen[key] = weight.contiguous().realize()
+    weight.replace(seen[key])
+  if fp16_compute:
+    for layer in nn.state.get_state_dict(model, tensor_type=Linear).values():
+      assert isinstance(layer, Linear)
+      if layer.weight.dtype != dtypes.half: raise ValueError('FP16 compute requires half weights')
+      layer.resident_fp16 = True

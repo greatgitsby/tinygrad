@@ -52,6 +52,7 @@ def _reg(shape:tuple[int, ...], slot:int, value:float, dep:UOp|None=None) -> UOp
 class Linear(nn.Linear):
   ggml_type:int|None = None
   use_custom_quant = True
+  resident_fp16 = False
   def __init__(self, in_features:int, out_features:int, bias=True):
     super().__init__(in_features, out_features, bias)
     self.in_features, self.out_features = in_features, out_features
@@ -86,6 +87,9 @@ class Linear(nn.Linear):
       self.weight = Tensor(UOp.from_buffer(cast(Buffer, raw.buf_uop.buffer)
         .view(raw.max_numel() * raw.dtype.itemsize // dtypes.uint32.itemsize, dtypes.uint32, raw_offset)))
   def __call__(self, x:Tensor) -> Tensor:
+    if self.resident_fp16:
+      out = x.cast(dtypes.half).dot(self.weight.transpose(), dtype=dtypes.float32)
+      return out if self.bias is None else out + self.bias
     supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
