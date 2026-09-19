@@ -228,6 +228,17 @@ class Qwen3VLRunner:
                                       any(t < 0 or t >= model.output.weight.shape[0] for t in allowed_tokens)):
       raise ValueError('allowed_tokens must be distinct vocabulary IDs')
     self.allowed_tokens = Tensor(allowed_tokens, dtype=dtypes.int32).realize() if allowed_tokens is not None else None
+    self.output = model.output
+    if allowed_tokens is not None:
+      # Project only the selected rows: full-vocabulary projection and gather can
+      # materialize a float32 vocabulary-sized temporary in the captured graph.
+      self.output = Linear(model.output.in_features, len(allowed_tokens), bias=model.output.bias is not None)
+      def select_rows(weight:Tensor) -> Tensor:
+        rows = [weight[t:t+1] for t in allowed_tokens]
+        return rows[0].cat(*rows[1:], dim=0).contiguous().realize()
+      self.output.weight = select_rows(model.output.weight)
+      if model.output.bias is not None: self.output.bias = select_rows(model.output.bias)
+      self.output.resident_fp16 = model.output.resident_fp16
     self.image_range, self.max_new_tokens = image_range, max_new_tokens
     self.prompt_len = len(tokens)
     self.next_position = lo+max(gh, gw)//2+len(tokens)-hi
@@ -242,9 +253,9 @@ class Qwen3VLRunner:
     self.jit = TinyJit(self.forward)
 
   def _greedy(self, x:Tensor) -> Tensor:
-    logits = self.model.output(self.model.output_norm(x[:, -1:]))[:, -1]
+    logits = self.output(self.model.output_norm(x[:, -1:]))[:, -1]
     if self.allowed_tokens is not None:
-      return self.allowed_tokens[logits[:, self.allowed_tokens].argmax(-1, keepdim=True)]
+      return self.allowed_tokens[logits.argmax(-1, keepdim=True)]
     return logits.argmax(-1, keepdim=True)
 
   def forward(self, image:Tensor) -> Tensor:

@@ -54,6 +54,9 @@ class TestQwen3VL(unittest.TestCase):
     runner = Qwen3VLRunner(self.model(), Vision(), [1, 2, 3], (1, 2), (1, 2, 2), 1, allowed_tokens=[4, 9, 12, 20])
     hidden = Tensor.randn(1, 1, 16).realize()
     logits = runner.model.output(runner.model.output_norm(hidden))[:, -1].tolist()[0]
+    self.assertEqual(runner.output.weight.shape, (4, 16))
+    selected = runner.output(runner.model.output_norm(hidden))[:, -1].tolist()[0]
+    for actual, token in zip(selected, [4, 9, 12, 20]): self.assertAlmostEqual(actual, logits[token], places=5)
     self.assertEqual(runner._greedy(hidden).tolist(), [[max([4, 9, 12, 20], key=lambda token: logits[token])]])
     for _ in range(5):
       image = Tensor.randn(1, 16).realize()
