@@ -48,6 +48,19 @@ class TestQwen3VL(unittest.TestCase):
       image = Tensor.randn(1, 16).realize()
       self.assertEqual(runner(image).tolist(), runner.forward(image).tolist())
 
+  def test_constrained_frame_graph(self):
+    class Vision:
+      def __call__(self, x): return x, [x], (1, 2, 2)
+    runner = Qwen3VLRunner(self.model(), Vision(), [1, 2, 3], (1, 2), (1, 2, 2), 1, allowed_tokens=[4, 9, 12, 20])
+    hidden = Tensor.randn(1, 1, 16).realize()
+    logits = runner.model.output(runner.model.output_norm(hidden))[:, -1].tolist()[0]
+    self.assertEqual(runner._greedy(hidden).tolist(), [[max([4, 9, 12, 20], key=lambda token: logits[token])]])
+    for _ in range(5):
+      image = Tensor.randn(1, 16).realize()
+      result = runner(image).tolist()
+      self.assertEqual(result, runner.forward(image).tolist())
+      self.assertIn(result[0][0], [4, 9, 12, 20])
+
 
 if __name__ == '__main__':
   unittest.main()

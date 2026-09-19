@@ -218,12 +218,16 @@ class Qwen3VLRunner:
   The caller truncates the returned tokens at EOS (extra computed tokens are ignored).
   """
   def __init__(self, model:Qwen3VL, vision:Qwen3Vision, tokens:list[int], image_range:tuple[int, int],
-               grid:tuple[int, int, int], max_new_tokens:int=16):
+               grid:tuple[int, int, int], max_new_tokens:int=16, allowed_tokens:list[int]|None=None):
     if not 1 <= max_new_tokens <= model.max_context-len(tokens): raise ValueError('invalid output budget')
     lo, hi = image_range
     _, gh, gw = grid
     if hi-lo != gh*gw//4: raise ValueError('image token count does not match grid')
     self.model, self.vision = model, vision
+    if allowed_tokens is not None and (not allowed_tokens or len(set(allowed_tokens)) != len(allowed_tokens) or
+                                      any(t < 0 or t >= model.output.weight.shape[0] for t in allowed_tokens)):
+      raise ValueError('allowed_tokens must be distinct vocabulary IDs')
+    self.allowed_tokens = Tensor(allowed_tokens, dtype=dtypes.int32).realize() if allowed_tokens is not None else None
     self.image_range, self.max_new_tokens = image_range, max_new_tokens
     self.prompt_len = len(tokens)
     self.next_position = lo+max(gh, gw)//2+len(tokens)-hi
@@ -238,7 +242,10 @@ class Qwen3VLRunner:
     self.jit = TinyJit(self.forward)
 
   def _greedy(self, x:Tensor) -> Tensor:
-    return self.model.output(self.model.output_norm(x[:, -1:]))[:, -1].argmax(-1, keepdim=True)
+    logits = self.model.output(self.model.output_norm(x[:, -1:]))[:, -1]
+    if self.allowed_tokens is not None:
+      return self.allowed_tokens[logits[:, self.allowed_tokens].argmax(-1, keepdim=True)]
+    return logits.argmax(-1, keepdim=True)
 
   def forward(self, image:Tensor) -> Tensor:
     embeds, deepstack, _ = self.vision(image)
