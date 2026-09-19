@@ -534,6 +534,9 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp|None: # ctx: a kept link (the jit's
   elif not ctx.use_rt:
     spec = BufferSpec(host=b.arg.volatile, uncached=b.arg.volatile or b.tag.startswith("cmdbuf"), cpu_access=True)
     r = Buffer(dev.device, b.max_numel(), b.dtype, options=spec, preallocate=True)
+    # These freshly allocated, immutable-to-the-GPU blobs can be patched locally.
+    # Never shadow device-owned rings, signals, or reused runtime allocations.
+    if b.tag.startswith(("cmdbuf", "kernargs")) and getattr(dev, "is_usb", False): cast(Any, r)._hcq_patch_shadow = {}
   else:
     off = dev.rt_allocator(True, b.arg.volatile).alloc(max(b.max_numel() * b.dtype.itemsize, 1), alignment=256)
     r = dev.rt_buffer(True, b.arg.volatile).view(b.max_numel(), b.dtype, off).ensure_allocated()
@@ -551,14 +554,33 @@ def fold_binary(buf:UOp, blob:UOp) -> UOp:
   if getattr(b:=cast(Buffer, base.buffer), '_hcq_written', {}).get(off) is not blob.arg: # TODO: remove me
     cast(Any, b.ensure_allocated())._hcq_written = getattr(b, '_hcq_written', {}) | {off: blob.arg}
     b.host.view(fmt='B')[off:off + len(blob.arg)] = blob.arg
+    if hasattr(b, '_hcq_patch_shadow'):
+      shadows = cast(Any, b)._hcq_patch_shadow
+      for start, shadow in tuple(shadows.items()):
+        if start < off+len(blob.arg) and off < start+len(shadow): del shadows[start]
+      shadows[off] = bytearray(blob.arg)
   return UOp(Ops.NOOP)
 
 def fold_words(buf:UOp, offs:UOp, ws:UOp) -> UOp:
   base, off = unwrap_view(buf)
-  mv = cast(Buffer, base.buffer).ensure_allocated().host.view(fmt='B')
+  b = cast(Buffer, base.buffer).ensure_allocated()
+  mv = b.host.view(fmt='B')
+  if (shadows:=getattr(b, '_hcq_patch_shadow', None)) and offs.src:
+    patches = [(off + o.val*w.dtype.itemsize, (w.val & (1 << 8*w.dtype.itemsize)-1).to_bytes(w.dtype.itemsize, 'little'))
+               for o, w in zip(offs.src, ws.src)]
+    lo, hi = min(p for p, _ in patches), max(p+len(v) for p, v in patches)
+    for start, shadow in shadows.items():
+      if start <= lo and hi <= start+len(shadow):
+        for p, value in patches: shadow[p-start:p-start+len(value)] = value
+        mv[lo:hi] = shadow[lo-start:hi-start]
+        return UOp(Ops.NOOP)
   for o, w in zip(offs.src, ws.src):
     n, at = w.dtype.itemsize, off + o.val * w.dtype.itemsize
-    mv[at:at + n] = (w.val & (1 << 8 * n) - 1).to_bytes(n, 'little')
+    value = (w.val & (1 << 8 * n) - 1).to_bytes(n, 'little')
+    mv[at:at + n] = value
+    if shadows:
+      for start, shadow in shadows.items():
+        if start <= at and at+n <= start+len(shadow): shadow[at-start:at-start+n] = value
   return UOp(Ops.NOOP)
 
 pm_link = PatternMatcher([
